@@ -1,131 +1,17 @@
-# Coworking Space Service Extension
-The Coworking Space Service is a set of APIs that enables users to request one-time tokens and administrators to authorize access to a coworking space. This service follows a microservice pattern and the APIs are split into distinct services that can be deployed and managed independently of one another.
+# Coworking Space Service — Analytics Deployment
 
-For this project, you are a DevOps engineer who will be collaborating with a team that is building an API for business analysts. The API provides business analysts basic analytics data on user activity in the service. The application they provide you functions as expected locally and you are expected to help build a pipeline to deploy it in Kubernetes.
+This repo contains the containerization and Kubernetes deployment pipeline for the coworking space analytics API, a Flask/SQLAlchemy service backed by PostgreSQL. The build pipeline is a single AWS CodeBuild project triggered on every push to this repository, defined declaratively in `buildspec.yaml` at the repo root. CodeBuild authenticates to Amazon ECR, builds the `analytics/Dockerfile` image, tags it with a semantic version derived from `$CODEBUILD_BUILD_NUMBER` (`1.0.<build_number>`), and pushes both that tag and `latest` to the `coworking` ECR repository.
 
-## Getting Started
+Runtime configuration is split between a Kubernetes `ConfigMap` (`deployment/configmap.yaml`) for non-sensitive values (DB host/port/name/user) and a `Secret` (`deployment/secret.yaml`) for the database password, both consumed by the `coworking` Deployment via `envFrom`/`env`. The `coworking` Deployment (`deployment/coworking.yaml`) runs the app as a `LoadBalancer` Service on port 5153, with liveness/readiness probes on `/health_check` and `/readiness_check`, and modest CPU/memory requests and limits sized for a low-traffic internal analytics API.
 
-### Dependencies
-#### Local Environment
-1. Python Environment - run Python 3.6+ applications and install Python dependencies via `pip`
-2. Docker CLI - build and run Docker images locally
-3. `kubectl` - run commands against a Kubernetes cluster
-4. `helm` - apply Helm Charts to a Kubernetes cluster
+PostgreSQL runs as its own in-cluster Deployment/Service backed by a manually provisioned `PersistentVolume`/`PersistentVolumeClaim` pair (`deployment/postgres/`), decoupled from the app so either can be redeployed independently. Application and infrastructure logs are collected through CloudWatch Container Insights (EKS add-on), giving visibility into pod health and the periodic background job that recomputes daily visit counts.
 
-#### Remote Resources
-1. AWS CodeBuild - build Docker images remotely
-2. AWS ECR - host Docker images
-3. Kubernetes Environment with AWS EKS - run applications in k8s
-4. AWS CloudWatch - monitor activity and logs in EKS
-5. GitHub - pull and clone code
+To release a new build: push a code change, let CodeBuild build/tag/push the new image automatically, then update the `image:` field in `deployment/coworking.yaml` to the new tag and run `kubectl apply -f deployment/coworking.yaml` to roll it out — Kubernetes performs a rolling update with zero downtime given the readiness probe. Database schema/seed changes live in `db/` and are applied manually via `psql` against the Postgres service, since they are one-time/idempotent operations and not part of the app's runtime image. All cluster-facing configuration is kept as plain YAML (no Helm) so the full desired state is visible and diffable in this repo.
 
-### Setup
-#### 1. Configure a Database
-Set up a Postgres database using a Helm Chart.
+## Stand-Out Suggestions
 
-1. Set up Bitnami Repo
-```bash
-helm repo add <REPO_NAME> https://charts.bitnami.com/bitnami
-```
+**Resource limits:** The `coworking` Deployment sets requests of 250m CPU / 256Mi memory and limits of 500m CPU / 512Mi, sized for a low-QPS internal analytics API with a lightweight background scheduler. This keeps a single pod from starving the node while leaving headroom for traffic spikes; values should be revisited after observing real CloudWatch Container Insights metrics.
 
-2. Install PostgreSQL Helm Chart
-```
-helm install <SERVICE_NAME> <REPO_NAME>/postgresql
-```
+**Instance type:** A burstable `t3.medium` (or `t3.small` for very light load) fits the EKS worker nodes well, since this workload is I/O-bound (waiting on Postgres) rather than CPU-bound, and `t3` baseline CPU credits comfortably absorb short bursts from the 30-second polling job. If CPU credits become consistently exhausted under real load, moving to a fixed `m6i.large` avoids throttling at a predictable cost.
 
-This should set up a Postgre deployment at `<SERVICE_NAME>-postgresql.default.svc.cluster.local` in your Kubernetes cluster. You can verify it by running `kubectl svc`
-
-By default, it will create a username `postgres`. The password can be retrieved with the following command:
-```bash
-export POSTGRES_PASSWORD=$(kubectl get secret --namespace default <SERVICE_NAME>-postgresql -o jsonpath="{.data.postgres-password}" | base64 -d)
-
-echo $POSTGRES_PASSWORD
-```
-
-<sup><sub>* The instructions are adapted from [Bitnami's PostgreSQL Helm Chart](https://artifacthub.io/packages/helm/bitnami/postgresql).</sub></sup>
-
-3. Test Database Connection
-The database is accessible within the cluster. This means that when you will have some issues connecting to it via your local environment. You can either connect to a pod that has access to the cluster _or_ connect remotely via [`Port Forwarding`](https://kubernetes.io/docs/tasks/access-application-cluster/port-forward-access-application-cluster/)
-
-* Connecting Via Port Forwarding
-```bash
-kubectl port-forward --namespace default svc/<SERVICE_NAME>-postgresql 5432:5432 &
-    PGPASSWORD="$POSTGRES_PASSWORD" psql --host 127.0.0.1 -U postgres -d postgres -p 5432
-```
-
-* Connecting Via a Pod
-```bash
-kubectl exec -it <POD_NAME> bash
-PGPASSWORD="<PASSWORD HERE>" psql postgres://postgres@<SERVICE_NAME>:5432/postgres -c <COMMAND_HERE>
-```
-
-4. Run Seed Files
-We will need to run the seed files in `db/` in order to create the tables and populate them with data.
-
-```bash
-kubectl port-forward --namespace default svc/<SERVICE_NAME>-postgresql 5432:5432 &
-    PGPASSWORD="$POSTGRES_PASSWORD" psql --host 127.0.0.1 -U postgres -d postgres -p 5432 < <FILE_NAME.sql>
-```
-
-### 2. Running the Analytics Application Locally
-In the `analytics/` directory:
-
-1. Install dependencies
-```bash
-pip install -r requirements.txt
-```
-2. Run the application (see below regarding environment variables)
-```bash
-<ENV_VARS> python app.py
-```
-
-There are multiple ways to set environment variables in a command. They can be set per session by running `export KEY=VAL` in the command line or they can be prepended into your command.
-
-* `DB_USERNAME`
-* `DB_PASSWORD`
-* `DB_HOST` (defaults to `127.0.0.1`)
-* `DB_PORT` (defaults to `5432`)
-* `DB_NAME` (defaults to `postgres`)
-
-If we set the environment variables by prepending them, it would look like the following:
-```bash
-DB_USERNAME=username_here DB_PASSWORD=password_here python app.py
-```
-The benefit here is that it's explicitly set. However, note that the `DB_PASSWORD` value is now recorded in the session's history in plaintext. There are several ways to work around this including setting environment variables in a file and sourcing them in a terminal session.
-
-3. Verifying The Application
-* Generate report for check-ins grouped by dates
-`curl <BASE_URL>/api/reports/daily_usage`
-
-* Generate report for check-ins grouped by users
-`curl <BASE_URL>/api/reports/user_visits`
-
-## Project Instructions
-1. Set up a Postgres database with a Helm Chart
-2. Create a `Dockerfile` for the Python application. Use a base image that is Python-based.
-3. Write a simple build pipeline with AWS CodeBuild to build and push a Docker image into AWS ECR
-4. Create a service and deployment using Kubernetes configuration files to deploy the application
-5. Check AWS CloudWatch for application logs
-
-### Deliverables
-1. `Dockerfile`
-2. Screenshot of AWS CodeBuild pipeline
-3. Screenshot of AWS ECR repository for the application's repository
-4. Screenshot of `kubectl get svc`
-5. Screenshot of `kubectl get pods`
-6. Screenshot of `kubectl describe svc <DATABASE_SERVICE_NAME>`
-7. Screenshot of `kubectl describe deployment <SERVICE_NAME>`
-8. All Kubernetes config files used for deployment (ie YAML files)
-9. Screenshot of AWS CloudWatch logs for the application
-10. `README.md` file in your solution that serves as documentation for your user to detail how your deployment process works and how the user can deploy changes. The details should not simply rehash what you have done on a step by step basis. Instead, it should help an experienced software developer understand the technologies and tools in the build and deploy process as well as provide them insight into how they would release new builds.
-
-
-### Stand Out Suggestions
-Please provide up to 3 sentences for each suggestion. Additional content in your submission from the standout suggestions do _not_ impact the length of your total submission.
-1. Specify reasonable Memory and CPU allocation in the Kubernetes deployment configuration
-2. In your README, specify what AWS instance type would be best used for the application? Why?
-3. In your README, provide your thoughts on how we can save on costs?
-
-### Best Practices
-* Dockerfile uses an appropriate base image for the application being deployed. Complex commands in the Dockerfile include a comment describing what it is doing.
-* The Docker images use semantic versioning with three numbers separated by dots, e.g. `1.2.1` and  versioning is visible in the  screenshot. See [Semantic Versioning](https://semver.org/) for more details.
+**Cost savings:** Combine a small on-demand node with a Spot-backed node group for the app/Postgres pods, since neither is stateful enough to require guaranteed on-demand capacity, and pair this with the EKS Cluster Autoscaler so node count shrinks automatically during idle periods. Also delete the EKS cluster (`eksctl delete cluster`) whenever not actively developing or testing, since the EKS control plane is billed hourly regardless of node usage.
