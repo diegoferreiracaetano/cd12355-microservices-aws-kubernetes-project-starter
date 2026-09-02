@@ -13,7 +13,10 @@ spec:
     spec:
       containers:
       - name: postgresql
-        image: postgres:latest
+        # Pinned to 16 because 18+ changed the on-disk data directory layout
+        # and is incompatible with mounting a volume directly at
+        # /var/lib/postgresql/data
+        image: postgres:16
         env:
         - name: POSTGRES_DB
           value: mydatabase
