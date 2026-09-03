@@ -25,3 +25,4 @@ phases:
       - echo Pushing the Docker images to ECR...
       - docker push $REPOSITORY_URI:$IMAGE_TAG
       - docker push $REPOSITORY_URI:latest
+# trigger CI
