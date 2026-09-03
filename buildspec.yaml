@@ -26,3 +26,4 @@ phases:
       - docker push $REPOSITORY_URI:$IMAGE_TAG
       - docker push $REPOSITORY_URI:latest
 # trigger CI
+# trigger CI
